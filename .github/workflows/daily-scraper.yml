@@ -127,6 +127,20 @@ jobs:
             git push
           fi
 
+      # Read-only check that the LIVE directory matches what ACHC lists
+      # tonight: care types parsed, no stale listings left published,
+      # nothing ACHC lists missing from the site (scrapers/
+      # check_content_health.py). Its own step, after the data refresh and
+      # sitemap, so a content problem is reported as a content problem and
+      # never blocks or masks the refresh itself. Anon key on purpose: it
+      # only needs what the public site can read.
+      - name: Content health check (live directory vs ACHC)
+        working-directory: ./scrapers
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+        run: python check_content_health.py normalized_dump.json
+
       # Production Supabase writes happen directly from the scraper
       # (write_to_supabase_direct, ENABLE_DIRECT_SUPABASE) above. Google
       # Sheets is now a read-only backup/audit trail only -- nothing reads

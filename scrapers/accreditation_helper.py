@@ -5,12 +5,6 @@ from typing import Dict, List
 
 import aiohttp
 
-try:
-    from bs4 import BeautifulSoup
-    _BS4_AVAILABLE = True
-except ImportError:
-    _BS4_AVAILABLE = False
-
 CANONICAL_PROGRAMS = [
     "Home Care",
     "Home Health",
@@ -44,31 +38,54 @@ _HEADERS = {
 }
 
 
+# ACHC's GetAccreditedServicesListByCompanyID response is one or more
+# accreditation periods, each shaped like:
+#   <p><strong>Dates:</strong> 10/21/2025 through 10/21/2028</p>
+#   <p><strong>Program:</strong> Home Health (Deemed)</p>
+#   <p><strong>Services:</strong> Home Health Aide Services, Skilled Nursing ...</p>
+# The program name is the text AFTER the bold "Program:" label, not inside
+# the bold tag. The previous parser only read text inside <strong>/<b>
+# tags, so it only ever saw the labels ("Dates:", "Program:",
+# "Services:"), never matched a program, and returned [] for every
+# provider (confirmed live 2026-11-11 against 7,370 providers). The
+# Services line is deliberately ignored: "Home Care Aide Services" is a
+# service under a program, not evidence of the Home Care program itself.
+_PROGRAM_LABEL_RE = re.compile(
+    r"<(?:strong|b)[^>]*>\s*Program\s*:?\s*</(?:strong|b)>\s*:?\s*([^<]+)",
+    flags=re.IGNORECASE,
+)
+# Longest names first, so a more specific program can't be shadowed by a
+# shorter one it happens to contain.
+_CANONICAL_BY_LENGTH = sorted(_CANONICAL_LOWER.items(), key=lambda kv: -len(kv[0]))
+
+
+def canonical_program(program_text: str) -> str:
+    """Map one ACHC 'Program:' value to a canonical program name, or ''.
+
+    Drops ACHC's qualifiers in parentheses, e.g. "Home Health (Deemed)" or
+    "Hospice (Deemed under parent provider number)".
+    """
+    text = re.sub(r"\([^)]*\)", " ", program_text or "")
+    text = re.sub(r"\s+", " ", text).strip().lower()
+    if not text:
+        return ""
+    if text in _CANONICAL_LOWER:
+        return _CANONICAL_LOWER[text]
+    for key, canonical in _CANONICAL_BY_LENGTH:
+        if text.startswith(key):
+            return canonical
+    return ""
+
+
 def parse_accreditation_html(html: str) -> List[str]:
+    """Return the sorted canonical programs listed in an ACHC accreditation response."""
     if not html:
         return []
-
-    if _BS4_AVAILABLE:
-        soup = BeautifulSoup(html, "html.parser")
-        candidates = []
-        for tag in soup.find_all(["b", "strong", "h3", "h4"]):
-            text = tag.get_text(separator=" ", strip=True)
-            if text:
-                candidates.append(text)
-    else:
-        candidates = re.findall(
-            r"<(?:b|strong|h[34])[^>]*>([^<]+)</(?:b|strong|h[34])>",
-            html,
-            flags=re.IGNORECASE,
-        )
-
     found = set()
-    for candidate in candidates:
-        candidate_lower = candidate.lower()
-        for key, canonical in _CANONICAL_LOWER.items():
-            if key in candidate_lower:
-                found.add(canonical)
-
+    for raw in _PROGRAM_LABEL_RE.findall(html):
+        canonical = canonical_program(raw)
+        if canonical:
+            found.add(canonical)
     return sorted(found)
 
 

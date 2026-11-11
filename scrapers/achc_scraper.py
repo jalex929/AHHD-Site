@@ -13,6 +13,7 @@ from dotenv import load_dotenv
 from geocode_helper import geocode_locations, geocode_locations_nominatim_fallback, print_dedup_report
 from places_helper import enrich_websites
 from accreditation_helper import fetch_accreditation_services, merge_ajax_services
+from retire_unseen import retire_unseen_locations
 from playwright.async_api import async_playwright
 
 try:
@@ -67,6 +68,8 @@ ENABLE_AJAX_ACCREDITATION = os.getenv("ENABLE_AJAX_ACCREDITATION", "true").lower
 ENABLE_WEBSITE_ENRICHMENT = os.getenv("ENABLE_WEBSITE_ENRICHMENT", "true").lower() == "true"
 ENABLE_GEOCODING        = os.getenv("ENABLE_GEOCODING", "true").lower() == "true"
 ENABLE_DIRECT_SUPABASE   = os.getenv("ENABLE_DIRECT_SUPABASE", "true").lower() == "true"
+ENABLE_RETIRE_UNSEEN     = os.getenv("ENABLE_RETIRE_UNSEEN", "true").lower() == "true"
+RETIRE_UNSEEN_DRY_RUN    = os.getenv("RETIRE_UNSEEN_DRY_RUN", "false").lower() == "true"
 
 SUPABASE_URL             = os.getenv("SUPABASE_URL", "")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
@@ -1389,6 +1392,19 @@ async def main():
         sb_result = await write_to_supabase_direct(normalized)
         print(f"Supabase direct write complete: {sb_result}")
         await notify_row_issues(sb_result, run_metadata)
+
+        # Hide published listings ACHC no longer lists (pending review), only
+        # after a complete national scrape has been written -- see
+        # retire_unseen.py for the safety rails. Non-fatal: a problem here
+        # must never mark an otherwise-good data refresh as failed.
+        if ENABLE_RETIRE_UNSEEN:
+            try:
+                retire_result = await retire_unseen_locations(
+                    normalized, run_metadata, dry_run=RETIRE_UNSEEN_DRY_RUN,
+                )
+                print(f"Retire-unseen result: {retire_result}")
+            except Exception as exc:
+                print(f"Retire-unseen failed (non-fatal, listings unchanged where not yet patched): {exc!r}")
     else:
         print("Direct Supabase write disabled (ENABLE_DIRECT_SUPABASE=false)")
 

@@ -1,4 +1,4 @@
-name: Normalization Unit Tests
+name: Scraper Unit Tests
 
 on:
   push:
@@ -23,5 +23,8 @@ jobs:
       - name: Install dependencies
         run: pip install -r scrapers/requirements.txt pytest
 
-      - name: Run normalization unit tests
-        run: pytest scrapers/test_normalize.py -v
+      # All scraper tests: normalization, ACHC program parsing, the
+      # hide-listings-ACHC-no-longer-lists step, and the content health
+      # checks.
+      - name: Run scraper unit tests
+        run: pytest scrapers/ -v
