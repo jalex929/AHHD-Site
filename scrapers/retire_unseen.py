@@ -1,34 +1,37 @@
-"""Hide published listings that ACHC no longer lists, pending human review.
+"""Keep the directory in step with ACHC's current accredited list.
 
-Why this exists (traced 2026-11-11): the only "this provider disappeared"
-check used to live in the Google Sheets Apps Script (rows not in a pull were
-marked possibly_inactive), and even then it only opened a review item -- it
-never hid the listing. When the Sheets sync was retired (2026-07-27) that
-check went with it. Result: 822 listings stayed published after dropping out
-of ACHC's accredited list (541 last seen in May 2026); spot checks against
-ACHC's accreditation lookup returned no accreditation at all for them.
+Two rules, applied after the nightly scrape has been written (Jay, 2026-11-11):
 
-What it does, after a COMPLETE nightly scrape has been written:
-  1. Finds published, publicly displayed locations in the active (MVP) care
-     types that are NOT in tonight's scrape (by ACHC accreditation ID) and
-     whose source_last_seen_at is older than this scrape minus a grace
-     period (default 2 days, so one missed run never hides anyone).
-     A listing whose ACHC ID IS in tonight's data is never hidden, even if
-     its last-seen date is old: ~230 rows a night are skipped by the merge
-     because of orphaned duplicate rows (see
-     20260731000100_skip_conflicting_duplicate_locations.sql), which freezes
-     the real listing's dates even though ACHC still lists it.
-  2. Moves them to listing_status='needs_review' -- hidden from the site,
-     nothing deleted -- and opens a review queue item explaining why.
-  3. If ACHC lists the provider again later, merge_google_sheets_data
-     republishes it automatically (confidence 'verified' -> 'published').
+  1. NOT LISTED by ACHC -> unpublished.
+     If ACHC no longer lists a provider, we treat it as no longer accredited:
+     listing_status='unpublished' and unpublished_at=now. No review item --
+     there's nothing for a person to decide. Nothing is deleted, and if ACHC
+     lists the provider again, merge_google_sheets_data republishes it
+     automatically (confidence 'verified' -> 'published').
 
-Safety rails (all must pass, or nothing is changed):
-  - the scrape was national, complete, not test mode, not row-limited, and
-    every requested program returned rows;
-  - the number to hide is at most MAX_RETIRE_FRACTION of what's published
-    (a sudden mass "disappearance" is far likelier to be a scrape problem
-    than real churn -- it gets skipped and logged instead).
+  2. LISTED by ACHC but no recognizable program ("care type unknown") ->
+     review queue. The provider is accredited, but we can't tell what it is
+     accredited for, so it can't be filed under Home Care / Home Health /
+     Hospice. Moved to listing_status='needs_review' with a review item.
+
+Why rule 1 exists (traced 2026-11-11): the only "this provider disappeared"
+check lived in the retired Google Sheets script (it never hid anything
+either). 822 listings stayed published after leaving ACHC's list; spot
+checks against ACHC's accreditation lookup found no accreditation for them.
+
+Who counts as "not listed": published, publicly displayed locations in the
+shown care types whose ACHC ID is NOT in tonight's scrape and whose
+source_last_seen_at is older than this scrape minus a grace period (default
+2 days, so one missed run never removes anyone).
+
+Safety rails:
+  - Rule 1 only runs after a national, complete, non-test, non-row-limited
+    scrape in which every requested program returned rows.
+  - Rule 1 won't unpublish more than MAX_RETIRE_FRACTION of what's published
+    at once; rule 2 won't flag more than MAX_UNTAGGED_FRACTION of tonight's
+    rows. Above either cap the step changes nothing and logs why (a mass
+    change is far likelier to be a scrape or parser problem than real
+    churn -- the content health check will fail loudly instead).
 """
 
 from __future__ import annotations
@@ -42,7 +45,8 @@ import aiohttp
 MVP_SERVICE_SLUGS = ("home-care", "home-health-care", "hospice")
 GRACE_DAYS = float(os.getenv("RETIRE_UNSEEN_GRACE_DAYS", "2"))
 MAX_RETIRE_FRACTION = float(os.getenv("RETIRE_UNSEEN_MAX_FRACTION", "0.15"))
-REVIEW_SUMMARY_PREFIX = "Not in ACHC accredited list"
+MAX_UNTAGGED_FRACTION = float(os.getenv("UNTAGGED_MAX_FRACTION", "0.05"))
+UNTAGGED_SUMMARY_PREFIX = "Listed by ACHC, care type unknown"
 PAGE_SIZE = 1000
 PATCH_BATCH = 150  # keeps location_id=in.(...) URLs well under PostgREST/URL limits
 
@@ -98,8 +102,9 @@ def select_unseen(locations: Iterable[dict], reference: datetime, seen_ids: Iter
                   grace_days: float = GRACE_DAYS) -> List[dict]:
     """Locations ACHC didn't list tonight AND last seen before (reference - grace).
 
-    Listings with no ACHC ID (orphaned duplicates from the pre-2026-07-27
-    pipeline) are judged on their last-seen date alone.
+    A listing whose ACHC ID is in tonight's data is never selected, even if
+    its last-seen date is old (a merge-skipped row can freeze its dates).
+    Listings with no ACHC ID are judged on their last-seen date alone.
     """
     seen = {str(i) for i in seen_ids if i}
     cutoff = reference - timedelta(days=grace_days)
@@ -113,19 +118,28 @@ def select_unseen(locations: Iterable[dict], reference: datetime, seen_ids: Iter
     return out
 
 
-def within_cap(n_to_retire: int, n_published: int, max_fraction: float = MAX_RETIRE_FRACTION) -> bool:
-    if n_to_retire == 0:
+def _services(row: dict) -> List[str]:
+    s = row.get("services") or []
+    return s if isinstance(s, list) else [x.strip() for x in str(s).split(",") if x.strip()]
+
+
+def select_untagged(normalized_rows: Iterable[dict]) -> List[str]:
+    """ACHC IDs listed tonight with no recognizable program at all."""
+    return [str(r["achc_company_id"]) for r in normalized_rows
+            if r.get("achc_company_id") and not _services(r)]
+
+
+def within_cap(n_changes: int, n_total: int, max_fraction: float = MAX_RETIRE_FRACTION) -> bool:
+    if n_changes == 0:
         return True
-    if n_published <= 0:
+    if n_total <= 0:
         return False
-    return n_to_retire / n_published <= max_fraction
+    return n_changes / n_total <= max_fraction
 
 
-def review_summary(loc: dict) -> str:
-    name = (loc.get("organization") or {}).get("organization_name") or loc.get("location_name") or "[unknown]"
-    seen = parse_ts(loc.get("source_last_seen_at"))
-    when = seen.date().isoformat() if seen else "never recorded"
-    return f"{REVIEW_SUMMARY_PREFIX} (last seen {when}): {name}. Hidden until verified."
+def untagged_summary(name: str) -> str:
+    return (f"{UNTAGGED_SUMMARY_PREFIX}: {name or '[unknown]'}. ACHC lists this provider, but no program "
+            f"(Home Care / Home Health / Hospice) was found. Confirm the care type before publishing.")
 
 
 # ---------------------------------------------------------------------------
@@ -136,23 +150,14 @@ def _headers(key: str) -> dict:
     return {"apikey": key, "Authorization": f"Bearer {key}", "Content-Type": "application/json"}
 
 
-async def fetch_published_mvp_locations(session: aiohttp.ClientSession, base: str, key: str) -> List[dict]:
-    slugs = ",".join(MVP_SERVICE_SLUGS)
-    url = (
-        f"{base}/rest/v1/locations?select=location_id,location_name,achc_source_id,source_last_seen_at,"
-        f"organization:organizations(organization_name),"
-        f"location_service_types!inner(service_types!inner(service_type_slug))"
-        f"&listing_status=eq.published&accepts_public_display=eq.true"
-        f"&location_service_types.service_types.service_type_slug=in.({slugs})"
-        f"&order=location_id"
-    )
+async def _get_all(session: aiohttp.ClientSession, url: str, key: str) -> List[dict]:
     rows: List[dict] = []
     start = 0
     while True:
         headers = {**_headers(key), "Range": f"{start}-{start + PAGE_SIZE - 1}"}
         async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=60)) as resp:
             if resp.status not in (200, 206):
-                raise Exception(f"fetch published locations failed: HTTP {resp.status} {(await resp.text())[:200]}")
+                raise Exception(f"GET failed: HTTP {resp.status} {(await resp.text())[:200]}")
             page = await resp.json()
         rows.extend(page)
         if len(page) < PAGE_SIZE:
@@ -160,15 +165,37 @@ async def fetch_published_mvp_locations(session: aiohttp.ClientSession, base: st
         start += PAGE_SIZE
 
 
-async def _open_review_location_ids(session, base, key, location_ids: List[str]) -> set:
+async def fetch_published_mvp_locations(session: aiohttp.ClientSession, base: str, key: str) -> List[dict]:
+    slugs = ",".join(MVP_SERVICE_SLUGS)
+    return await _get_all(session, (
+        f"{base}/rest/v1/locations?select=location_id,location_name,achc_source_id,source_last_seen_at,"
+        f"organization:organizations(organization_name),"
+        f"location_service_types!inner(service_types!inner(service_type_slug))"
+        f"&listing_status=eq.published&accepts_public_display=eq.true"
+        f"&location_service_types.service_types.service_type_slug=in.({slugs})"
+        f"&order=location_id"), key)
+
+
+async def _patch_locations(session, base, key, location_ids: List[str], body: dict) -> int:
+    changed = 0
+    for i in range(0, len(location_ids), PATCH_BATCH):
+        chunk = location_ids[i:i + PATCH_BATCH]
+        url = f"{base}/rest/v1/locations?location_id=in.({','.join(chunk)})&listing_status=eq.published"
+        async with session.patch(url, json=body, headers={**_headers(key), "Prefer": "return=representation"},
+                                 timeout=aiohttp.ClientTimeout(total=60)) as resp:
+            if resp.status not in (200, 204):
+                raise Exception(f"patch failed: HTTP {resp.status} {(await resp.text())[:200]}")
+            changed += len(await resp.json()) if resp.status == 200 else 0
+    return changed
+
+
+async def _open_review_location_ids(session, base, key, location_ids: List[str], prefix: str) -> set:
     found = set()
     for i in range(0, len(location_ids), PATCH_BATCH):
         chunk = ",".join(location_ids[i:i + PATCH_BATCH])
-        url = (
-            f"{base}/rest/v1/review_queue_items?select=location_id"
-            f"&location_id=in.({chunk})&review_status=eq.open"
-            f"&issue_summary=like.{REVIEW_SUMMARY_PREFIX.replace(' ', '%20')}*"
-        )
+        url = (f"{base}/rest/v1/review_queue_items?select=location_id"
+               f"&location_id=in.({chunk})&review_status=eq.open"
+               f"&issue_summary=like.{prefix.replace(' ', '%20').replace(',', '%2C')}*")
         async with session.get(url, headers=_headers(key), timeout=aiohttp.ClientTimeout(total=60)) as resp:
             if resp.status != 200:
                 raise Exception(f"review lookup failed: HTTP {resp.status} {(await resp.text())[:200]}")
@@ -176,67 +203,86 @@ async def _open_review_location_ids(session, base, key, location_ids: List[str])
     return found
 
 
+async def _unpublish_unlisted(session, base, key, normalized_rows, run_metadata, dry_run, result) -> None:
+    safe, why = run_is_safe_to_retire(run_metadata)
+    if not safe:
+        result["unlisted_skipped_reason"] = why
+        print(f"Unpublish-unlisted skipped: {why}")
+        return
+    reference = scrape_reference_time(normalized_rows, run_metadata)
+    if reference is None:
+        result["unlisted_skipped_reason"] = "no scrape timestamp"
+        return
+
+    published = await fetch_published_mvp_locations(session, base, key)
+    unseen = select_unseen(published, reference, [r.get("achc_company_id") for r in normalized_rows])
+    result.update(published_before=len(published), unlisted_candidates=len(unseen))
+    print(f"Unpublish-unlisted: {len(unseen)} of {len(published)} published listings not in ACHC's list tonight "
+          f"and not seen since {(reference - timedelta(days=GRACE_DAYS)).date()} (grace {GRACE_DAYS:g} days)")
+    if not within_cap(len(unseen), len(published), MAX_RETIRE_FRACTION):
+        result["unlisted_skipped_reason"] = (f"{len(unseen)}/{len(published)} exceeds the {MAX_RETIRE_FRACTION:.0%} "
+                                             f"safety cap -- likely a scrape problem, nothing changed")
+        print(f"Unpublish-unlisted skipped: {result['unlisted_skipped_reason']}")
+        return
+    if dry_run or not unseen:
+        return
+    now = datetime.now(timezone.utc).isoformat()
+    result["unpublished"] = await _patch_locations(
+        session, base, key, [l["location_id"] for l in unseen],
+        {"listing_status": "unpublished", "unpublished_at": now})
+
+
+async def _review_untagged(session, base, key, normalized_rows, dry_run, result) -> None:
+    ids = select_untagged(normalized_rows)
+    result["untagged_listed"] = len(ids)
+    if not ids:
+        return
+    if not within_cap(len(ids), len(normalized_rows), MAX_UNTAGGED_FRACTION):
+        result["untagged_skipped_reason"] = (f"{len(ids)}/{len(normalized_rows)} rows have no program -- exceeds the "
+                                             f"{MAX_UNTAGGED_FRACTION:.0%} cap, likely a parser problem, nothing changed")
+        print(f"Review-untagged skipped: {result['untagged_skipped_reason']}")
+        return
+    locs: List[dict] = []
+    for i in range(0, len(ids), PATCH_BATCH):
+        locs += await _get_all(session, (
+            f"{base}/rest/v1/locations?select=location_id,location_name,listing_status,"
+            f"organization:organizations(organization_name)"
+            f"&achc_source_id=in.({','.join(ids[i:i + PATCH_BATCH])})"), key)
+    published = [l for l in locs if l.get("listing_status") == "published"]
+    print(f"Review-untagged: {len(ids)} listed tonight with no program; {len(published)} currently published")
+    if dry_run or not locs:
+        return
+    result["untagged_to_review"] = await _patch_locations(
+        session, base, key, [l["location_id"] for l in published], {"listing_status": "needs_review"})
+    already = await _open_review_location_ids(session, base, key, [l["location_id"] for l in locs],
+                                              UNTAGGED_SUMMARY_PREFIX)
+    now = datetime.now(timezone.utc).isoformat()
+    items = [{"location_id": l["location_id"], "review_type": "other", "severity": "medium", "review_status": "open",
+              "issue_summary": untagged_summary((l.get("organization") or {}).get("organization_name")
+                                                or l.get("location_name")),
+              "opened_at": now} for l in locs if l["location_id"] not in already]
+    for i in range(0, len(items), PATCH_BATCH):
+        async with session.post(f"{base}/rest/v1/review_queue_items", json=items[i:i + PATCH_BATCH],
+                                headers={**_headers(key), "Prefer": "return=minimal"},
+                                timeout=aiohttp.ClientTimeout(total=60)) as resp:
+            if resp.status not in (200, 201, 204):
+                raise Exception(f"review insert failed: HTTP {resp.status} {(await resp.text())[:200]}")
+    result["reviews_opened"] = len(items)
+
+
 async def retire_unseen_locations(normalized_rows: List[dict], run_metadata: dict, dry_run: bool = False) -> dict:
+    """Run both rules. Returns a summary dict for the run log."""
     base = os.getenv("SUPABASE_URL", "").rstrip("/")
     key = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
-    result = {"retired": 0, "reviews_opened": 0, "skipped_reason": "", "dry_run": dry_run}
+    result = {"dry_run": dry_run, "unpublished": 0, "untagged_to_review": 0, "reviews_opened": 0}
     if not base or not key:
         result["skipped_reason"] = "Supabase credentials not set"
         return result
-
-    safe, why = run_is_safe_to_retire(run_metadata)
-    if not safe:
-        result["skipped_reason"] = why
-        print(f"Retire-unseen skipped: {why}")
-        return result
-
-    reference = scrape_reference_time(normalized_rows, run_metadata)
-    if reference is None:
-        result["skipped_reason"] = "no scrape timestamp"
-        return result
-
     async with aiohttp.ClientSession() as session:
-        published = await fetch_published_mvp_locations(session, base, key)
-        seen_ids = [r.get("achc_company_id") for r in normalized_rows]
-        unseen = select_unseen(published, reference, seen_ids)
-        result.update(published_before=len(published), candidates=len(unseen), reference=reference.isoformat())
-        print(f"Retire-unseen: {len(unseen)} of {len(published)} published listings not in tonight's ACHC data, not seen since "
-              f"{(reference - timedelta(days=GRACE_DAYS)).date()} (grace {GRACE_DAYS:g} days)")
-
-        if not within_cap(len(unseen), len(published)):
-            result["skipped_reason"] = (f"{len(unseen)}/{len(published)} exceeds the "
-                                        f"{MAX_RETIRE_FRACTION:.0%} safety cap -- likely a scrape problem, nothing hidden")
-            print(f"Retire-unseen skipped: {result['skipped_reason']}")
-            return result
-        if not unseen or dry_run:
-            if dry_run:
-                print("Retire-unseen dry run: no changes written")
-            return result
-
-        ids = [loc["location_id"] for loc in unseen]
-        already_open = await _open_review_location_ids(session, base, key, ids)
-        for i in range(0, len(ids), PATCH_BATCH):
-            chunk = ids[i:i + PATCH_BATCH]
-            url = f"{base}/rest/v1/locations?location_id=in.({','.join(chunk)})&listing_status=eq.published"
-            async with session.patch(url, json={"listing_status": "needs_review"},
-                                     headers={**_headers(key), "Prefer": "return=minimal"},
-                                     timeout=aiohttp.ClientTimeout(total=60)) as resp:
-                if resp.status not in (200, 204):
-                    raise Exception(f"retire patch failed: HTTP {resp.status} {(await resp.text())[:200]}")
-            result["retired"] += len(chunk)
-
-        now = datetime.now(timezone.utc).isoformat()
-        items = [{
-            "location_id": loc["location_id"], "review_type": "other", "severity": "medium",
-            "review_status": "open", "issue_summary": review_summary(loc), "opened_at": now,
-        } for loc in unseen if loc["location_id"] not in already_open]
-        for i in range(0, len(items), PATCH_BATCH):
-            async with session.post(f"{base}/rest/v1/review_queue_items", json=items[i:i + PATCH_BATCH],
-                                    headers={**_headers(key), "Prefer": "return=minimal"},
-                                    timeout=aiohttp.ClientTimeout(total=60)) as resp:
-                if resp.status not in (200, 201, 204):
-                    raise Exception(f"review insert failed: HTTP {resp.status} {(await resp.text())[:200]}")
-            result["reviews_opened"] += len(items[i:i + PATCH_BATCH])
-
-    print(f"Retire-unseen: hid {result['retired']} listings (needs_review), opened {result['reviews_opened']} review items")
+        await _unpublish_unlisted(session, base, key, normalized_rows, run_metadata, dry_run, result)
+        await _review_untagged(session, base, key, normalized_rows, dry_run, result)
+    if dry_run:
+        print("Dry run: no changes written")
+    print(f"Directory sync: unpublished {result['unpublished']} no-longer-listed; "
+          f"moved {result['untagged_to_review']} care-type-unknown to review ({result['reviews_opened']} items opened)")
     return result

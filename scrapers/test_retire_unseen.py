@@ -1,4 +1,7 @@
-"""Tests for the hide-listings-ACHC-no-longer-lists step (retire_unseen.py).
+"""Tests for the nightly directory sync rules (retire_unseen.py).
+
+Rule 1: not listed by ACHC -> unpublished. Rule 2: listed but care type
+unknown -> review queue (Jay, 2026-11-11).
 
 These cover the decision logic only (no network): when it is safe to act,
 who counts as unseen, the mass-disappearance cap, and the duplicate-conflict
@@ -14,10 +17,11 @@ from datetime import datetime, timedelta, timezone
 sys.path.insert(0, os.path.dirname(__file__))
 
 from retire_unseen import (  # noqa: E402
-    review_summary,
     run_is_safe_to_retire,
     scrape_reference_time,
+    select_untagged,
     select_unseen,
+    untagged_summary,
     within_cap,
 )
 
@@ -134,10 +138,28 @@ def test_ids_compare_as_strings():
     assert select_unseen([loc("a", None, achc=75467)], REF, seen_ids=["75467"]) == []
 
 
-# --- review item wording ---------------------------------------------------------
+# --- rule 2: listed by ACHC, care type unknown -> review ------------------------------
 
-def test_review_summary_says_why_and_when():
-    text = review_summary(loc("a", "2026-05-10T00:00:00+00:00"))
-    assert text.startswith("Not in ACHC accredited list (last seen 2026-05-10): Org a.")
-    assert "Hidden until verified" in text
-    assert "never recorded" in review_summary(loc("b", None))
+def test_untagged_rows_are_selected_by_achc_id():
+    rows = [{"achc_company_id": "1", "services": ["Hospice"]},
+            {"achc_company_id": "2", "services": []},
+            {"achc_company_id": "3", "services": ""},
+            {"achc_company_id": "", "services": []}]
+    assert select_untagged(rows) == ["2", "3"]
+
+
+def test_non_shown_program_still_counts_as_tagged():
+    # "Private Duty" is a known program -- not shown on the site, but not unknown either.
+    assert select_untagged([{"achc_company_id": "1", "services": ["Private Duty"]}]) == []
+
+
+def test_untagged_cap_blocks_a_broken_parser():
+    # The 2026-11-11 parser bug left 21% untagged; that must not mass-move listings.
+    assert not within_cap(1529, 7370, max_fraction=0.05)
+    assert within_cap(12, 7370, max_fraction=0.05)
+
+
+def test_untagged_review_text_says_what_to_check():
+    text = untagged_summary("Acme Hospice")
+    assert text.startswith("Listed by ACHC, care type unknown: Acme Hospice.")
+    assert "Confirm the care type before publishing" in text
