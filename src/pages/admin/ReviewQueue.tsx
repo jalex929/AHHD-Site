@@ -3,6 +3,21 @@ import { useAuth } from '../../contexts/AuthContext';
 import { supabase } from '../../lib/supabase';
 import { useState, useEffect } from 'react';
 import type { LocationWithDetails } from '../../types/database';
+import { checkSiteReadiness, sourceLabel } from '../../lib/siteReadiness';
+
+const readinessFor = (location: LocationWithDetails) =>
+  checkSiteReadiness({
+    source_system: location.source_system,
+    achc_source_id: location.achc_source_id,
+    organization_name: location.organization?.organization_name,
+    address_line_1: location.address_line_1,
+    city: location.city,
+    state: location.state,
+    postal_code: location.postal_code,
+    latitude: location.latitude,
+    longitude: location.longitude,
+    service_type_slugs: (location.service_types || []).map((st) => st.service_type_slug || '').filter(Boolean),
+  });
 
 export default function ReviewQueue() {
   const { signOut } = useAuth();
@@ -44,6 +59,9 @@ export default function ReviewQueue() {
   };
 
   const handleApprove = async (locationId: string) => {
+    // Re-check here too, so the rule holds even if the button state is stale.
+    const location = locations.find((l) => l.location_id === locationId);
+    if (!location || !readinessFor(location).ready) return;
     try {
       const { error } = await supabase
         .from('locations')
@@ -122,7 +140,9 @@ export default function ReviewQueue() {
           </div>
         ) : (
           <div className="space-y-6">
-            {locations.map((location) => (
+            {locations.map((location) => {
+              const readiness = readinessFor(location);
+              return (
               <div key={location.location_id} className="card p-6">
                 <div className="flex items-start justify-between mb-4">
                   <div className="flex-1">
@@ -133,9 +153,14 @@ export default function ReviewQueue() {
                       <p className="text-sm text-neutral-600 mt-1">{location.location_name}</p>
                     )}
                   </div>
-                  <span className="px-3 py-1 bg-amber-100 text-amber-900 rounded-full text-xs font-semibold">
-                    Needs Review
-                  </span>
+                  <div className="flex flex-col items-end gap-2">
+                    <span className="px-3 py-1 bg-amber-100 text-amber-900 rounded-full text-xs font-semibold">
+                      Needs Review
+                    </span>
+                    <span className="px-3 py-1 bg-neutral-100 text-neutral-800 rounded-full text-xs font-medium">
+                      Source: {sourceLabel(location.source_system, location.achc_source_id)}
+                    </span>
+                  </div>
                 </div>
 
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4 text-sm">
@@ -179,10 +204,34 @@ export default function ReviewQueue() {
                   </a>
                 )}
 
+                <div className="mb-4 rounded-lg border border-neutral-300 p-4">
+                  <p className="text-sm font-semibold text-navy-800 mb-2">
+                    Site-ready checks: {readiness.checks.filter((c) => c.passed).length} of {readiness.checks.length} passed
+                  </p>
+                  <ul className="space-y-1 text-sm">
+                    {readiness.checks.map((check) => (
+                      <li key={check.id} className="flex items-start gap-2">
+                        {check.passed ? (
+                          <CheckCircle2 className="w-4 h-4 mt-0.5 text-success-700 flex-shrink-0" aria-hidden="true" />
+                        ) : (
+                          <XCircle className="w-4 h-4 mt-0.5 text-red-700 flex-shrink-0" aria-hidden="true" />
+                        )}
+                        <span>
+                          <span className="sr-only">{check.passed ? 'Passed: ' : 'Failed: '}</span>
+                          <span className="font-medium text-navy-800">{check.label}</span>
+                          {!check.passed && <span className="text-neutral-700"> - {check.detail}</span>}
+                        </span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+
                 <div className="flex gap-3 pt-4 border-t border-neutral-500">
                   <button
                     onClick={() => handleApprove(location.location_id)}
-                    className="flex-1 px-4 py-2.5 bg-success-600 text-white rounded-lg hover:bg-success-700 transition-colors font-medium flex items-center justify-center gap-2"
+                    disabled={!readiness.ready}
+                    aria-describedby={readiness.ready ? undefined : `not-ready-${location.location_id}`}
+                    className="flex-1 px-4 py-2.5 bg-success-600 text-white rounded-lg hover:bg-success-700 transition-colors font-medium flex items-center justify-center gap-2 disabled:bg-neutral-300 disabled:text-neutral-700 disabled:cursor-not-allowed"
                   >
                     <CheckCircle2 className="w-4 h-4" aria-hidden="true" />
                     Approve & Publish
@@ -195,8 +244,14 @@ export default function ReviewQueue() {
                     Reject
                   </button>
                 </div>
+                {!readiness.ready && (
+                  <p id={`not-ready-${location.location_id}`} className="mt-2 text-sm text-neutral-700">
+                    Approve is off until every check passes.
+                  </p>
+                )}
               </div>
-            ))}
+              );
+            })}
           </div>
         )}
       </main>

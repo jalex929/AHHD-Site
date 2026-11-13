@@ -81,6 +81,44 @@ Instead of pre-fetching website URLs via a paid API, each provider page gets a l
 
 **Disclaimer copy for the site** (final): _"This search is launched using the information we have on file for this location. Please confirm the results you see match before relying on them — details can change over time, and some organizations operate under a different name (a "doing business as" name) than the legal entity name on file with their accrediting body."_
 
+## Decided: listings must match ACHC's current list (2026-11-11)
+
+Traced and fixed in PRs #1 and #2 (see their descriptions for the evidence):
+- **Program parser:** ACHC's accreditation lookup lists the program after a bold `Program:` label. The old parser read only the bold text, so it returned nothing for every provider and 1,523 accredited providers were hidden. Now 100% of scraped providers get a care type.
+- **Not listed by ACHC → unpublished.** If ACHC stops listing a provider, it's treated as no longer accredited: `listing_status='unpublished'`, nothing deleted, republished automatically if ACHC lists it again (676 unpublished on the first run).
+- **Listed by ACHC, care type unknown → review queue** (`needs_review` + review item).
+- **Orphan duplicates removed:** 578 copies created by HTML-encoded names (`&amp;`) before 2026-05-31, with a JSON backup kept locally (`../data/duplicate-cleanup/backups/`).
+- **Nightly content health check** (workflow step): care-type coverage, no stale published listings, accredited providers not missing, frozen-listing warning.
+- Live count after the fixes: 7,299 (2026-11-12).
+
+## Decided: review queue shows the source and gates approval on site-ready checks (2026-11-13)
+
+**Rule (Jay):** a listing in the Review Queue can be approved only if it passes every site-ready check. For now, anything that did not come from ACHC's own accredited list cannot be approved, because nothing independently confirms its accreditation yet.
+
+What was built:
+- **Source tags** on `locations.source_system`: `achc` (nightly scrape; also the column's database default) and `admin_manual` (the admin Add New Listing wizard now sets this explicitly). Before this, hand-entered listings were silently tagged `achc`.
+- **Site-ready checks** (`src/lib/siteReadiness.ts`, tests in `siteReadiness.test.ts`): accreditation confirmed by ACHC (`source_system='achc'` **and** an ACHC accreditation ID), clean provider name (no `&amp;`), complete address, map coordinates, and a care type the site shows.
+- **Review Queue page:** shows a source badge and the checklist on each item; **Approve & Publish is disabled** until every check passes, and the approve handler re-checks before publishing.
+
+The one item in the queue on 2026-11-13 (1st Choice Home Health Care & Hospice, Oklahoma City) is tagged `achc` but has no ACHC ID (a May import), so it correctly can't be approved.
+
+## Next steps (build backlog)
+
+Review queue and sources:
+- **Auto-publish** items that pass every check and come from ACHC, so a person only sees the ones that genuinely need judgment.
+- **A way to verify manual entries** (e.g. look the provider up on ACHC's site by name and address, and attach the ACHC ID if found), so a manual entry can become approvable instead of permanently blocked.
+- Add source tags for any future intake paths (public "Get Listed" submissions, bulk imports) and show them in Manage Listings, not only the queue.
+- Backfill: every existing row is `achc` by default. Rows with no `achc_source_id` are the ones whose real origin is unknown; review them.
+
+Data and admin cleanup (found while documenting the admin, 2026-11-13):
+- **Empty `&amp;` organizations** still appear in admin › Organizations next to their clean twins (left over from the duplicate cleanup). Remove organizations that have no locations.
+- **36 merge skips a night / 18 frozen listings:** 4 are one provider holding two ACHC IDs at one address; 32 unexplained. Investigate.
+- **Edit Listing** reopens the wizard at the Google Maps search step instead of showing the listing's current details.
+- **Images, Content, and Search Analytics** admin pages are placeholders (no functionality yet).
+
+Tooling:
+- **ESLint can't parse TypeScript** anywhere in this repo (`Parsing error` on `interface` / `import type`), so lint gives no signal. Fix the parser config.
+
 ## Open questions / not yet decided
 - Whether to reconnect Google Sheets as an audit trail once the MVP data is stable in Supabase (currently disconnected — no completion/failure emails fire while it's off).
 - Whether to run the remaining ~115 untested records from the 250-sample (would need a fresh session or a raised WebSearch budget) — the completed 135 may already be sufficient signal.

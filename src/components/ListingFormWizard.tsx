@@ -524,6 +524,9 @@ export default function ListingFormWizard({ locationId, onClose, onSave }: Listi
         insurance_accepted: insuranceArray.length > 0 ? insuranceArray : null,
         featured_in_alphabetical: formData.is_enhanced,
         listing_status: 'needs_review',
+        // The column defaults to 'achc'; tag hand-entered listings so the
+        // Review Queue can tell them apart (see src/lib/siteReadiness.ts).
+        source_system: 'admin_manual',
       };
 
       const { data: newLocation, error: locationError } = await supabase
